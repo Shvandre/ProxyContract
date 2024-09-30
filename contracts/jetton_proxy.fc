@@ -1,0 +1,188 @@
+#include "imports/stdlib.fc";
+#pragma version >=0.2.0;
+
+const min_tons_for_storage = 10000000; ;; 0.01 TON
+const gas_consumption = 10000000; ;; 0.01 TON
+
+
+{-
+  Storage
+  storage#_ listOfAllowed:^Cell + up to 3 addr Cell
+-}
+;;allowed tuple, allowed_to_all
+(tuple, int) load_data() inline {
+  tuple addresses = empty_tuple();
+  slice ds = get_data().begin_parse(); 
+  int i = 0;
+  cell next = ds~load_maybe_ref();
+  int allowed_to_all = ds~load_uint(1);
+  while(true) {
+    if(ds.slice_empty?()) {
+      if(next.null?()) {
+        return (addresses, allowed_to_all);
+      }
+      else {
+        ds = next.begin_parse();
+        next = ds~load_maybe_ref();
+      }
+    }
+    slice address = ds~load_msg_addr();
+    addresses~tpush(address); ;;Add address to list
+  }
+  return (addresses, allowed_to_all);
+}
+
+(int) tlen (tuple t) asm "TLEN";
+(builder, ()) ~store_slice(builder, slice) asm "STSLICER";
+
+() save_data (tuple list, int allowed_to_all) impure inline {
+  builder cur = begin_cell();
+  cur~store_uint(0, 1); ;;No next cell
+  cur~store_uint(allowed_to_all, 1);
+  int i = 0;
+  int len = tlen(list);
+  while (i < len) {
+        slice x = list.at(i);
+        if(i == 3) {
+          i = 0;
+          var next = begin_cell();
+          next~store_uint(1, 1);
+          next.store_ref(cur.end_cell());
+          cur = next;
+        }
+        cur~store_slice(x);
+        i = i + 1;
+  }
+  cell res = cur.end_cell();
+  set_data(res);
+}
+
+
+() on_bounce (slice in_msg_body) impure {
+  return ();
+}
+
+
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  if (in_msg_body.slice_empty?()) { ;; ignore empty messages
+    return ();
+  }
+
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  if (flags & 1) {
+    on_bounce(in_msg_body);
+    return ();
+  }
+  slice sender_address = cs~load_msg_addr();
+
+  int op_code = in_msg_body~load_uint(32);
+  if(op_code == "transfer_request"c) { 
+    cell payload = in_msg_body~load_ref();
+    slice payload_cs = payload.begin_parse();  
+    slice whoWantToSend = payload_cs~load_msg_addr();
+    payload_cs.end_parse();
+    tuple allowed_addresses = null();
+    int allowed_to_all = null();
+    (allowed_addresses, allowed_to_all) = load_data();
+    int allow = allowed_to_all; ;;False
+    int len = tlen(allowed_addresses);
+    int i = 0;
+    while(i < len) { 
+      slice x = allowed_addresses.at(i);
+      if(equal_slices(x, whoWantToSend)) {
+        allow = 1;
+      }
+      i = i + 1;
+    }
+    if(allow == 0) {
+      var msg = begin_cell()
+      .store_uint(0x18, 6)
+      .store_slice(whoWantToSend)
+      .store_coins(0)
+      .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1);
+      send_raw_message(msg.end_cell(), 64 + 2);
+      throw(710);
+    }
+    var newBody = begin_cell()
+    .store_uint("op::allowed_transfer"c, 32)
+    .store_slice(in_msg_body)
+    .end_cell();
+
+    var msg = begin_cell()
+      .store_uint(0x18, 6)
+      .store_slice(sender_address)
+      .store_coins(0)
+      .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+      .store_ref(newBody);
+
+      send_raw_message(msg.end_cell(), 64); 
+    return ();
+  }
+  if(op_code == "allow_to_address"c) {
+    tuple allowed_addresses = null();
+    int allowed_to_all = 0;
+    (allowed_addresses, allowed_to_all) = load_data();
+    slice owner_address = allowed_addresses.at(0);
+    throw_unless(equal_slices(sender_address, owner_address), 709);
+    slice address_to_allow = in_msg_body~load_msg_addr();
+    allowed_addresses~tpush(address_to_allow);
+    
+    save_data(allowed_addresses, allowed_to_all);
+    return ();
+  }
+  if(op_code == "switch_allow_to_all"c) {
+    tuple allowed_addresses = null();
+    int allowed_to_all = 0;
+    (allowed_addresses, allowed_to_all) = load_data();
+    slice owner_address = allowed_addresses.at(0);
+    throw_unless(equal_slices(sender_address, owner_address), 711);
+    allowed_to_all = 1 - allowed_to_all;
+    save_data(allowed_addresses, allowed_to_all);
+    return ();
+  }
+  if(op_code == "set_new_code"c) {
+    tuple allowed_addresses = null();
+    int allowed_to_all = 0;
+    (allowed_addresses, allowed_to_all) = load_data();
+    slice owner_address = allowed_addresses.at(0);
+    throw_unless(equal_slices(sender_address, owner_address), 712);
+    cell new_code = in_msg_body~load_ref();
+    set_code(new_code);
+  }
+  if(op_code == "set_new_data"c) {
+    tuple allowed_addresses = null();
+    int allowed_to_all = 0;
+    (allowed_addresses, allowed_to_all) = load_data();
+    slice owner_address = allowed_addresses.at(0);
+    throw_unless(equal_slices(sender_address, owner_address), 713);
+    cell new_data = in_msg_body~load_ref();
+    set_data(new_data);
+  }
+  throw(6666);
+}
+
+(int, int) get_saved_addresses() method_id {
+  tuple res = null();
+  int allowed_to_all = 0;
+  (res, allowed_to_all) = load_data();
+  if(allowed_to_all) {
+    ~strdump("Now trading is allowed to all");
+  }
+  int i = 0;
+  int len = tlen(res);
+  
+  while(i < len) {
+    int a = null();
+    int b = null(); 
+    slice x = res.at(i);
+    (a, b) = parse_std_addr(x);
+    
+    ~dump(a);
+    ~dump(b);
+    ~strdump("------------");
+    i = i + 1;
+  }
+  return (allowed_to_all, len);
+}
